@@ -299,7 +299,9 @@ export const useStore = create((set, get) => {
         const out = await pullFromSheet(() => get().S, loadSheetsCfg(), opts)
         persist(out.S, false)
         const last = new Date().toISOString()
-        saveSheetsCfg({ ...loadSheetsCfg(), names: out.names, last, insights: out.insights || {} })
+        const c = { ...loadSheetsCfg(), names: out.names, last, insights: out.insights || {} }
+        if (out.bodySheet) c.bodySheet = out.bodySheet
+        saveSheetsCfg(c)
         set({ sheets: { busy: false, err: null, last, counts: out.counts } })
       } catch (e) {
         set({ sheets: { ...get().sheets, busy: false, err: String(e.message || e) } })
@@ -312,8 +314,8 @@ export const useStore = create((set, get) => {
       const cfg = loadSheetsCfg()
       if (!cfg) return
       try {
-        const { next } = await pushToSheet(get().S, cfg)
-        saveSheetsCfg({ ...loadSheetsCfg(), pushed: next })
+        const { next, bodyNext } = await pushToSheet(get().S, cfg)
+        saveSheetsCfg({ ...loadSheetsCfg(), pushed: next, bodySheet: bodyNext })
         if (get().sheets.err) set({ sheets: { ...get().sheets, err: null } })
       } catch (e) {
         set({ sheets: { ...get().sheets, err: String(e.message || e) } })
