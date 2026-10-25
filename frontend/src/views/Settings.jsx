@@ -9,6 +9,7 @@ import { pushSupported, enablePush, disablePush, sendTestPush } from '../lib/pus
 import { wakeLockSupported } from '../lib/wakelock.js'
 import { t, LANGS, INSTR_LANGS } from '../lib/i18n.js'
 import { DEMO, REPO } from '../lib/demo.js'
+import { SHEETS } from '../lib/sheets-sync.js'
 import { MOBILE, shareExport, syncReminder } from '../lib/mobile.js'
 import { ConnectSheet } from './MobileOnboarding.jsx'
 import {
@@ -145,9 +146,19 @@ export default function Settings() {
       {/* ---------- account (demo and mobile builds have nothing to sign in to) ---------- */}
       <Section
         title={
-          MOBILE ? (user ? t('Your server') : t('Your data')) : DEMO ? t('Demo') : t('Account')
+          MOBILE
+            ? user
+              ? t('Your server')
+              : t('Your data')
+            : SHEETS
+              ? t('Google Sheets')
+              : DEMO
+                ? t('Demo')
+                : t('Account')
         }>
-        {MOBILE ? (
+        {SHEETS ? (
+          <SheetsRows />
+        ) : MOBILE ? (
           user ? (
             <>
               <Row
@@ -322,7 +333,7 @@ export default function Settings() {
           />
         )}
       </Section>
-      {!user && !DEMO && !MOBILE && (
+      {!user && !DEMO && !MOBILE && !SHEETS && (
         <p className="sect-f" style={{ marginTop: -18, marginBottom: 22 }}>
           {t('Guest mode — data lives only in this browser.')}
         </p>
@@ -1134,5 +1145,165 @@ function RegisterInline({ close, setUser, pushState, pullState, toast }) {
         {t('Create passkey')}
       </Button>
     </>
+  )
+}
+
+/* ---------- Google Sheets (VITE_SHEETS=1 build) ---------- */
+function SheetsRows() {
+  const sheets = useStore(s => s.sheets)
+  const connected = useStore(s => s.sheetsConnected())
+  const { sheetsPull, sheetsDisconnect } = useStore()
+  const toast = useUI(s => s.toast)
+  const when = sheets.last ? new Date(sheets.last).toLocaleString() : null
+  if (!connected)
+    return (
+      <Row
+        icon="link"
+        iconTint="var(--acc)"
+        title={t('Connect your Google Sheet')}
+        subtitle={t('Paste the connection link from the sheet’s Lift Log menu → Connect openGym.')}
+        accessory="chevron"
+        onClick={() => useUI.getState().openSheet(close => <SheetsConnect close={close} />)}
+      />
+    )
+  return (
+    <>
+      <Row
+        icon="lock"
+        iconTint="var(--acc)"
+        title={t('Synced with your Google Sheet')}
+        subtitle={
+          sheets.err
+            ? t('Last sync failed: {0}', sheets.err)
+            : when
+              ? t('Last synced {0}', when)
+              : t('Not synced yet')
+        }
+      />
+      <Row
+        icon="reset"
+        iconTint="var(--blue)"
+        title={sheets.busy ? t('Syncing…') : t('Sync now')}
+        subtitle={t('Sends your workouts; brings in Strong history, Strava cardio and weigh-ins.')}
+        accessory="chevron"
+        onClick={async () => {
+          if (sheets.busy) return
+          await sheetsPull()
+          const st = useStore.getState().sheets
+          if (st.err) toast(t('Sync failed: {0}', st.err))
+          else if (st.counts)
+            toast(
+              t(
+                'Synced — {0} workouts, {1} cardio, {2} weigh-ins',
+                st.counts.workouts,
+                st.counts.cardio,
+                st.counts.weighIns
+              )
+            )
+        }}
+      />
+      <Row
+        icon="link"
+        iconTint="var(--indigo)"
+        title={t('Change connection')}
+        accessory="chevron"
+        onClick={() => useUI.getState().openSheet(close => <SheetsConnect close={close} />)}
+      />
+      <Row
+        icon="signOut"
+        iconTint="var(--red)"
+        title={t('Disconnect')}
+        subtitle={t('Stops syncing. Your data stays on this phone and in the sheet.')}
+        danger
+        onClick={() =>
+          confirmSheet({
+            title: t('Disconnect from your Google Sheet?'),
+            message: t('Nothing is deleted — this phone just stops syncing.'),
+            confirmText: t('Disconnect'),
+            danger: true,
+            onConfirm: () => {
+              sheetsDisconnect()
+              toast(t('Disconnected'))
+            }
+          })
+        }
+      />
+    </>
+  )
+}
+
+function SheetsConnect({ close }) {
+  const [text, setText] = useState('')
+  const [busy, setBusy] = useState(false)
+  const [err, setErr] = useState('')
+  const { sheetsConnect } = useStore()
+  const toast = useUI(s => s.toast)
+  const paste = async () => {
+    try {
+      setText(await navigator.clipboard.readText())
+    } catch {
+      setErr(t('Couldn’t read the clipboard — long-press the box and paste.'))
+    }
+  }
+  const go = async () => {
+    setBusy(true)
+    setErr('')
+    try {
+      await sheetsConnect(text)
+      const c = useStore.getState().sheets.counts
+      close()
+      toast(
+        c
+          ? t(
+              'Connected — {0} workouts, {1} cardio, {2} weigh-ins',
+              c.workouts,
+              c.cardio,
+              c.weighIns
+            )
+          : t('Connected')
+      )
+    } catch (e) {
+      const m = String(e.message || e)
+      setErr(
+        m === 'bad_link'
+          ? t('That isn’t a connection link. Copy it again from the sheet.')
+          : m === 'bad_token'
+            ? t('The sheet didn’t accept this link. Make a new one from the sheet’s menu.')
+            : t('Couldn’t reach the sheet: {0}', m)
+      )
+    } finally {
+      setBusy(false)
+    }
+  }
+  return (
+    <div>
+      <h3 style={{ marginBottom: 8 }}>{t('Connect your Google Sheet')}</h3>
+      <p className="muted" style={{ lineHeight: 1.5, marginBottom: 12 }}>
+        {t(
+          'In your Lift Log sheet on a computer: Lift Log menu → Connect openGym. Copy the link it shows (or scan its code), then paste it here.'
+        )}
+      </p>
+      <TextField
+        value={text}
+        onChange={e => setText(e.target.value)}
+        placeholder="https://…?sheets=…&k=…"
+        autoCapitalize="off"
+        autoCorrect="off"
+        spellCheck={false}
+      />
+      <div style={{ height: 10 }} />
+      <Button variant="ghost" onClick={paste}>
+        {t('Paste from clipboard')}
+      </Button>
+      {err && (
+        <p className="muted" style={{ color: 'var(--red)', marginTop: 10 }}>
+          {err}
+        </p>
+      )}
+      <div style={{ height: 10 }} />
+      <button className="btn primary" disabled={busy || !text.trim()} onClick={go}>
+        {busy ? t('Connecting…') : t('Connect')}
+      </button>
+    </div>
   )
 }
