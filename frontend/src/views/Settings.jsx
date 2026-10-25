@@ -1203,6 +1203,33 @@ function SheetsRows() {
         }}
       />
       <Row
+        icon="reset"
+        iconTint="var(--acc)"
+        title={t('Re-import routines from the sheet')}
+        subtitle={t(
+          'Replaces the routines that came from your sheet’s templates. Ones you made here stay.'
+        )}
+        accessory="chevron"
+        onClick={() =>
+          confirmSheet({
+            title: t('Re-import routines?'),
+            message: t(
+              'Routines from the sheet are rebuilt from its Templates tab. Your workout history isn’t touched.'
+            ),
+            confirmText: t('Re-import'),
+            onConfirm: async () => {
+              await sheetsPull(false, { replaceRoutines: true })
+              const st = useStore.getState().sheets
+              toast(
+                st.err
+                  ? t('Sync failed: {0}', st.err)
+                  : t('{0} routines imported', (st.counts || {}).routines || 0)
+              )
+            }
+          })
+        }
+      />
+      <Row
         icon="link"
         iconTint="var(--indigo)"
         title={t('Change connection')}
