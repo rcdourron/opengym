@@ -288,7 +288,7 @@ export const useStore = create((set, get) => {
       saveSheetsCfg(null)
       set({ sheets: { busy: false, err: null, last: null, counts: null } })
     },
-    async sheetsPull(throwErr = false) {
+    async sheetsPull(throwErr = false, opts = {}) {
       const cfg = loadSheetsCfg()
       if (!cfg) return
       sheetsLastPull = Date.now()
@@ -296,7 +296,7 @@ export const useStore = create((set, get) => {
       try {
         // Send anything unsent first so the pull can't resurrect a deleted workout's row.
         await get().sheetsPush(true)
-        const out = await pullFromSheet(() => get().S, loadSheetsCfg())
+        const out = await pullFromSheet(() => get().S, loadSheetsCfg(), opts)
         persist(out.S, false)
         const last = new Date().toISOString()
         saveSheetsCfg({ ...loadSheetsCfg(), names: out.names, last, insights: out.insights || {} })
