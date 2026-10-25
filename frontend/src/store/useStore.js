@@ -13,6 +13,14 @@ import {
   writeAutoBackup
 } from '../lib/mobile.js'
 import { loadRemote, chooseLocal, forgetRemote, connect } from '../lib/remote.js'
+import {
+  SHEETS,
+  loadCfg as loadSheetsCfg,
+  saveCfg as saveSheetsCfg,
+  parseConnection,
+  pullFromSheet,
+  pushToSheet
+} from '../lib/sheets-sync.js'
 
 const KEY = 'gym_state_v1'
 export const DEF = {
@@ -85,6 +93,8 @@ export function restoredStateFor(local, remote, dirty = false) {
 export const useStore = create((set, get) => {
   let pushTm = null
   let saveTm = null
+  let sheetsTm = null
+  let sheetsLastPull = 0
 
   initReminderSync(() => get().S)
 
@@ -109,6 +119,10 @@ export const useStore = create((set, get) => {
       clearTimeout(pushTm)
       pushTm = setTimeout(() => get().pushState(), 1500)
     }
+    if (SHEETS && push && loadSheetsCfg()) {
+      clearTimeout(sheetsTm)
+      sheetsTm = setTimeout(() => get().sheetsPush(), 2500)
+    }
   }
 
   // A setting changed right before switching away/closing the tab must not get lost mid-debounce
@@ -128,7 +142,19 @@ export const useStore = create((set, get) => {
       pushTm = null
       get().pushState()
     }
+    if (sheetsTm) {
+      clearTimeout(sheetsTm)
+      sheetsTm = null
+      get().sheetsPush()
+    }
   })
+  // Sheets build: coming back to the app after a while picks up new Strava runs, weigh-ins and
+  // workouts logged elsewhere.
+  if (SHEETS)
+    document.addEventListener('visibilitychange', () => {
+      if (document.visibilityState === 'visible' && Date.now() - sheetsLastPull > 5 * 60e3)
+        get().sheetsPull()
+    })
 
   // Everything a sign-out leaves behind on this device, whichever way it was triggered.
   const clearLocalSession = () => {
@@ -153,6 +179,8 @@ export const useStore = create((set, get) => {
       }
     })(),
     ready: false,
+    // Sheets build only: { busy, err, last, counts } for Settings. Not persisted.
+    sheets: { busy: false, err: null, last: (loadSheetsCfg() || {}).last || null, counts: null },
     needsMobileOnboarding: false, // mobile build only — set true by boot() on a genuine first launch
 
     // Mutate a draft of S via producer fn, then persist + schedule sync.
@@ -239,6 +267,60 @@ export const useStore = create((set, get) => {
       clearLocalSession()
     },
 
+    // ---------- Google Sheets (VITE_SHEETS=1) ----------
+    sheetsConnected: () => !!loadSheetsCfg(),
+    async sheetsConnect(text) {
+      const c = parseConnection(text)
+      if (!c) throw new Error('bad_link')
+      const prev = loadSheetsCfg()
+      saveSheetsCfg({ ...(prev && prev.url === c.url ? prev : {}), ...c })
+      // A fresh install with nothing logged yet takes the sheet's unit (pounds).
+      if (!hasData(get().S) && get().S.unit !== 'lb') get().update(s => (s.unit = 'lb'), false)
+      try {
+        await get().sheetsPull(true)
+      } catch (e) {
+        if (!prev) saveSheetsCfg(null)
+        throw e
+      }
+    },
+    sheetsDisconnect() {
+      clearTimeout(sheetsTm)
+      saveSheetsCfg(null)
+      set({ sheets: { busy: false, err: null, last: null, counts: null } })
+    },
+    async sheetsPull(throwErr = false) {
+      const cfg = loadSheetsCfg()
+      if (!cfg) return
+      sheetsLastPull = Date.now()
+      set({ sheets: { ...get().sheets, busy: true, err: null } })
+      try {
+        // Send anything unsent first so the pull can't resurrect a deleted workout's row.
+        await get().sheetsPush(true)
+        const out = await pullFromSheet(() => get().S, loadSheetsCfg())
+        persist(out.S, false)
+        const last = new Date().toISOString()
+        saveSheetsCfg({ ...loadSheetsCfg(), names: out.names, last, insights: out.insights || {} })
+        set({ sheets: { busy: false, err: null, last, counts: out.counts } })
+      } catch (e) {
+        set({ sheets: { ...get().sheets, busy: false, err: String(e.message || e) } })
+        if (throwErr) throw e
+      }
+    },
+    async sheetsPush(throwErr = false) {
+      clearTimeout(sheetsTm)
+      sheetsTm = null
+      const cfg = loadSheetsCfg()
+      if (!cfg) return
+      try {
+        const { next } = await pushToSheet(get().S, cfg)
+        saveSheetsCfg({ ...loadSheetsCfg(), pushed: next })
+        if (get().sheets.err) set({ sheets: { ...get().sheets, err: null } })
+      } catch (e) {
+        set({ sheets: { ...get().sheets, err: String(e.message || e) } })
+        if (throwErr) throw e
+      }
+    },
+
     // Mobile-only ("connect to my server" onboarding, see App.jsx's needsMobileOnboarding).
     // Picking local — even before there's any data — persists the choice so onboarding never
     // asks again.
@@ -320,6 +402,23 @@ export const useStore = create((set, get) => {
         // the choice. Picking local (even with no data yet) persists that choice below and this
         // never asks again.
         set({ ready: true, needsMobileOnboarding: !remote && !hasData(get().S) })
+        return
+      }
+      // Sheets build (GitHub Pages): no openGym server — guest mode, synced with a Google Sheet.
+      // A connection link (…?sheets=<web app>&k=<key>) opened in this app connects it directly.
+      if (SHEETS) {
+        get().setGuest(true)
+        set({ ready: true })
+        const q = new URLSearchParams(location.search)
+        if (q.get('sheets')) {
+          const link = location.href
+          history.replaceState(null, '', location.pathname + location.hash)
+          try {
+            await get().sheetsConnect(link)
+          } catch (e) {
+            /* Settings shows the error */
+          }
+        } else get().sheetsPull()
         return
       }
       // Demo build (GitHub Pages): no backend at all — seed once, stay in guest mode.
