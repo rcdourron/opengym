@@ -342,30 +342,125 @@ function fromCardioRow(c, ctx) {
   }
 }
 
-function routineFromTemplate(t, ctx, unit) {
-  const ex = (t.exercises || [])
-    .map(e => {
-      const id = idForName(e.name, ctx)
-      if (!id) return null
-      const work = (e.sets || []).filter(s => s.t !== 'W')
-      const first = work[0] || (e.sets || [])[0] || {}
-      const top = Math.max(0, ...work.map(s => s.w || 0))
-      const cfg = {
-        id,
-        sets: Math.max(1, work.length || 1),
-        reps: first.r || 8,
-        weight: fromLb(top, unit)
+const PER_SIDE = /\bper (side|leg|arm)\b/i
+const SUPERSET = /\bsuperset with\b/i
+const RANGE = /×\s*(\d+)\s*[–-]\s*(\d+)/
+
+/** Plan tab rows → { key: value } */
+const planOf = resp => {
+  const out = {}
+  ;((resp && resp.plan && resp.plan.rows) || []).forEach(r => {
+    if (Array.isArray(r) && r[0]) out[String(r[0])] = String(r[1] == null ? '' : r[1])
+  })
+  return out
+}
+/** "10:20" min/mile → km/h */
+const paceToKmh = p => {
+  const m = /^(\d+):(\d{2})$/.exec(String(p || '').trim())
+  if (!m) return 0
+  const min = +m[1] + +m[2] / 60
+  return min > 0 ? round1((60 / min) * 1.609344) : 0
+}
+
+/**
+ * A sheet template (Lift Log shape) → an openGym routine. Keeps rest, warm-up count, timed holds,
+ * per-side work (openGym counts both sides, so per-side reps are doubled), rep ranges as double
+ * progression, supersets, coaching notes, and the cardio the summary or plan calls for.
+ */
+export function routineFromTemplate(t, ctx, unit, plan = {}) {
+  const list = t.exercises || []
+  const ex = []
+  const srcIdx = []
+  list.forEach((e, i) => {
+    const id = idForName(e.name, ctx)
+    if (!id) return
+    const all = e.sets || []
+    const warm = all.filter(s => s.t === 'W')
+    const work = all.filter(s => s.t !== 'W')
+    const first = work[0] || all[0] || {}
+    const top = Math.max(0, ...work.map(s => Number(s.w) || 0))
+    let note = String(e.note || '').trim()
+    const side = e.unit !== 'm' && e.unit !== 'sec' && PER_SIDE.test(note)
+    const cfg = { id, sets: Math.max(1, work.length || 1) }
+    if (e.unit === 'sec') {
+      cfg.mode = 'time'
+      cfg.sec = Math.max(1, Number(first.r) || 45)
+      cfg.weight = fromLb(top, unit)
+    } else {
+      if (e.unit === 'm') note = (first.r || 0) + ' m per set. ' + note
+      const reps = Math.max(1, Number(first.r) || 8)
+      cfg.mode = 'reps'
+      cfg.reps = side ? reps * 2 : reps
+      cfg.weight = fromLb(top, unit)
+      if (side) cfg.side = true
+      const range = e.unit === 'm' ? null : RANGE.exec(note)
+      if (top > 0 && range && +range[1] < +range[2]) {
+        cfg.prog = 'double'
+        cfg.repsMin = +range[1] * (side ? 2 : 1)
+        cfg.reps = +range[2] * (side ? 2 : 1)
       }
-      if (e.unit === 'sec') {
-        cfg.mode = 'time'
-        cfg.sec = first.r || 45
-        delete cfg.reps
-      }
-      if (e.rest) cfg.rest = e.rest
-      if (e.note) cfg.note = String(e.note).slice(0, 500)
-      return cfg
+    }
+    if (!(top > 0)) {
+      cfg.bodyweight = true
+      cfg.prog = 'off'
+    }
+    if (warm.length) cfg.warmupSets = Math.min(5, warm.length)
+    if (e.rest > 0) cfg.restSec = Math.round(e.rest)
+    if (note) cfg.note = note.slice(0, 500)
+    ex.push(cfg)
+    srcIdx.push(i)
+  })
+  // "Superset with X" pairs an exercise with the one after it.
+  ex.forEach((cfg, k) => {
+    if (cfg.note && SUPERSET.test(cfg.note) && ex[k + 1]) {
+      const sg = 'ss' + (k + 1)
+      cfg.sg = sg
+      ex[k + 1].sg = sg
+    }
+  })
+  // Session-level coaching note rides on the first exercise.
+  const tnote = String(t.note || '').trim()
+  if (tnote && ex[0])
+    ex[0].note = ('Session: ' + tnote + (ex[0].note ? ' · ' + ex[0].note : '')).slice(0, 500)
+
+  // Cardio the template's summary or the plan calls for.
+  const summary = String(t.summary || '')
+  const easy = paceToKmh(plan.easy_pace) || 9
+  const walk = /then (\d+) min[^,·]*walk/i.exec(summary)
+  if (walk && EXIDX['3666'])
+    ex.push({ id: '3666', sets: 1, min: +walk[1], speed: 5, note: 'Easy incline walk.' })
+  const intervals = /(\d+)\s*×\s*1-min intervals/i.exec(summary)
+  if (intervals && EXIDX['0685']) {
+    const rounds = +plan.intervals_start_rounds || +intervals[1]
+    const work = +plan.interval_work_sec || 60
+    const rest = +plan.interval_rest_sec || 60
+    ex.push({
+      id: '0685',
+      sets: rounds,
+      min: round1(work / 60),
+      speed: round1(easy * 1.3),
+      restSec: rest,
+      note:
+        'Intervals: ' +
+        work +
+        ' s hard, ' +
+        rest +
+        ' s easy. Rounds grow with the plan; see your weekly review.'
     })
-    .filter(Boolean)
+  }
+  if (/easy run/i.test(summary) && EXIDX['0685']) {
+    const min = +plan.easy_run_start_min || 35
+    ex.unshift({
+      id: '0685',
+      sets: 1,
+      min,
+      speed: easy,
+      note:
+        'Easy run first' +
+        (plan.easy_pace ? ', slower than ' + plan.easy_pace + ' per mile' : '') +
+        '. Minutes grow with the plan; see your weekly review.'
+    })
+  }
   return { id: 'tpl-' + slug(t.id || t.name), name: t.name || 'Routine', emoji: DEFAULT_GLYPH, ex }
 }
 
@@ -374,7 +469,7 @@ function routineFromTemplate(t, ctx, unit) {
  * user's own workouts, routines and manual weigh-ins are left alone.
  * Returns { S, names, counts }.
  */
-export function mergePull(S0, resp, prevNames = {}) {
+export function mergePull(S0, resp, prevNames = {}, opts = {}) {
   const S = JSON.parse(JSON.stringify(S0))
   const unit = S.unit === 'kg' ? 'kg' : 'lb'
   const ctx = { byName: {}, names: { ...prevNames }, customs: {} }
@@ -427,10 +522,22 @@ export function mergePull(S0, resp, prevNames = {}) {
       .sort((a, b) => (a.d < b.d ? -1 : 1))
   }
 
+  // Templates become routines the first time, or on request (Settings → Re-import routines),
+  // which replaces only the routines that came from the sheet and keeps any made in openGym.
   let routines = 0
-  if (!(S.routines || []).length && Array.isArray(resp.templates) && resp.templates.length) {
-    S.routines = resp.templates.map(t => routineFromTemplate(t, ctx, unit)).filter(r => r.ex.length)
-    routines = S.routines.length
+  const tpls = Array.isArray(resp.templates) ? resp.templates : []
+  if (tpls.length && (opts.replaceRoutines || !(S.routines || []).length)) {
+    const plan = planOf(resp)
+    const fresh = tpls.map(t => routineFromTemplate(t, ctx, unit, plan)).filter(r => r.ex.length)
+    const ids = new Set(fresh.map(r => r.id))
+    const kept = (S.routines || []).filter(r => !ids.has(r.id) && !String(r.id).startsWith('tpl-'))
+    S.routines = fresh.concat(kept)
+    // a weekday pointing at a routine that no longer exists falls back to rest
+    const live = new Set(S.routines.map(r => r.id))
+    Object.keys(S.week || {}).forEach(d => {
+      if (S.week[d] && !live.has(S.week[d])) delete S.week[d]
+    })
+    routines = fresh.length
   }
 
   const have = new Set((S.customEx || []).map(c => c.id))
@@ -464,9 +571,9 @@ export async function testConnection(cfg) {
 }
 
 /** Fetch, then merge into whatever the state is NOW (it may have changed while waiting). */
-export async function pullFromSheet(getS, cfg) {
+export async function pullFromSheet(getS, cfg, opts = {}) {
   const resp = await post(cfg, { op: 'pull' })
-  const out = mergePull(getS(), resp, cfg.names || {})
+  const out = mergePull(getS(), resp, cfg.names || {}, opts)
   registerCustom(out.S.customEx)
   out.insights = resp.insights || {}
   return out

@@ -1,5 +1,12 @@
 import { describe, it, expect } from 'vitest'
-import { parseConnection, toSheetRows, buildPush, mergePull, sheetDate } from './sheets-sync.js'
+import {
+  parseConnection,
+  toSheetRows,
+  buildPush,
+  mergePull,
+  sheetDate,
+  routineFromTemplate
+} from './sheets-sync.js'
 
 const URL0 = 'https://script.google.com/macros/s/AKfycbTEST_abc-123/exec'
 const KEY = 'a1b2c3d4e5f6a1b2c3d4e5f6a1b2c3d4'
@@ -104,7 +111,13 @@ describe('mergePull', () => {
     expect(run.entries[0].sets[0].speed).toBeCloseTo(9.7, 1)
     expect(S.customEx.find(c => c.id === 'cx-ride').bp).toBe('cardio')
     expect(S.bodyweight.map(b => b.w)).toEqual([201.6, 201.3])
-    expect(S.routines[0].ex[0]).toMatchObject({ sets: 2, reps: 8, weight: 155, rest: 150 })
+    expect(S.routines[0].ex[0]).toMatchObject({
+      sets: 2,
+      reps: 8,
+      weight: 155,
+      restSec: 150,
+      warmupSets: 1
+    })
     expect(S.exWeights[w.entries[0].id].w).toBe(155)
   })
 
@@ -222,5 +235,154 @@ describe('push', () => {
     S.workouts = S.workouts.filter(w => w.id !== 'w1')
     const gone = buildPush(S, { names, pushed: first.next })
     expect(gone.deletes).toEqual(['og-w1'])
+  })
+})
+
+describe('routineFromTemplate', () => {
+  const ctx = () => ({ byName: {}, names: {}, customs: {} })
+  const plan = {
+    easy_pace: '10:20',
+    easy_run_start_min: '35',
+    intervals_start_rounds: '6',
+    interval_work_sec: '60',
+    interval_rest_sec: '60'
+  }
+  const tplA = {
+    id: 'day-a',
+    name: 'Day A',
+    summary: 'Squat, bench · ~75 min, then 15 min easy incline walk',
+    note: 'Warm up first.',
+    exercises: [
+      {
+        name: 'Bird Dog',
+        rest: 30,
+        note: 'Per side. Hold 5 sec.',
+        sets: [
+          { w: 0, r: 6 },
+          { w: 0, r: 6 }
+        ]
+      },
+      {
+        name: 'Side Plank',
+        unit: 'sec',
+        rest: 30,
+        note: 'Per side.',
+        sets: [
+          { w: 0, r: 20 },
+          { w: 0, r: 20 }
+        ]
+      },
+      {
+        name: 'Bench Press (Barbell)',
+        rest: 150,
+        note: '3 × 6–8. Add 5 lb once all sets hit 8.',
+        sets: [
+          { w: 95, r: 10, t: 'W' },
+          { w: 135, r: 5, t: 'W' },
+          { w: 155, r: 8 },
+          { w: 155, r: 8 },
+          { w: 155, r: 8 }
+        ]
+      },
+      {
+        name: 'Pallof Press (Cable)',
+        rest: 30,
+        note: 'Per side. Superset with Hammer Curl.',
+        sets: [{ w: null, r: 10 }]
+      },
+      {
+        name: 'Hammer Curl (Dumbbell)',
+        rest: 60,
+        note: '3 × 10–12.',
+        sets: [
+          { w: 30, r: 12 },
+          { w: 30, r: 12 }
+        ]
+      },
+      {
+        name: 'Suitcase Carry',
+        unit: 'm',
+        rest: 60,
+        note: 'Per side, 50 lb.',
+        sets: [{ w: 50, r: 40 }]
+      }
+    ]
+  }
+
+  it('keeps rest, warm-ups, timed holds, per-side reps, ranges, supersets and notes', () => {
+    const r = routineFromTemplate(tplA, ctx(), 'lb', plan)
+    expect(r.id).toBe('tpl-day-a')
+    const [bird, plank, bench, pallof, curl, carry, walk] = r.ex
+    expect(bird).toMatchObject({
+      sets: 2,
+      mode: 'reps',
+      reps: 12,
+      side: true,
+      bodyweight: true,
+      prog: 'off',
+      restSec: 30
+    })
+    expect(bird.note.startsWith('Session: Warm up first.')).toBe(true)
+    expect(plank).toMatchObject({ mode: 'time', sec: 20, sets: 2 })
+    expect(plank.side).toBeUndefined()
+    expect(bench).toMatchObject({
+      sets: 3,
+      reps: 8,
+      repsMin: 6,
+      prog: 'double',
+      weight: 155,
+      warmupSets: 2,
+      restSec: 150
+    })
+    expect(pallof.sg).toBeTruthy()
+    expect(curl.sg).toBe(pallof.sg)
+    expect(curl).toMatchObject({ prog: 'double', repsMin: 10, reps: 12, weight: 30 })
+    expect(carry).toMatchObject({ reps: 40, weight: 50 })
+    expect(carry.side).toBeUndefined()
+    expect(carry.note.startsWith('40 m per set.')).toBe(true)
+    expect(walk).toMatchObject({ id: '3666', sets: 1, min: 15 })
+  })
+
+  it('adds intervals and the easy run from the plan', () => {
+    const b = routineFromTemplate(
+      { id: 'b', name: 'B', summary: 'Hinge · then 6 × 1-min intervals', exercises: [] },
+      ctx(),
+      'lb',
+      plan
+    )
+    expect(b.ex[0]).toMatchObject({ id: '0685', sets: 6, min: 1, restSec: 60 })
+    const c = routineFromTemplate(
+      {
+        id: 'c',
+        name: 'C',
+        summary: 'Ski add-on after the day-2 easy run',
+        exercises: [{ name: 'Glute Bridge', sets: [{ w: 0, r: 12 }] }]
+      },
+      ctx(),
+      'lb',
+      plan
+    )
+    expect(c.ex[0]).toMatchObject({ id: '0685', sets: 1, min: 35 })
+    expect(c.ex[0].speed).toBeCloseTo(9.3, 1)
+    expect(c.ex[0].note).toContain('10:20')
+  })
+
+  it('re-import replaces sheet routines only and clears stale weekdays', () => {
+    let S = {
+      ...base(),
+      routines: [
+        { id: 'tpl-old', name: 'Old', ex: [] },
+        { id: 'mine', name: 'Mine', ex: [] }
+      ],
+      week: { 1: 'tpl-old', 3: 'mine' }
+    }
+    S = mergePull(
+      S,
+      { templates: [tplA], plan: { rows: [['easy_pace', '10:20']] } },
+      {},
+      { replaceRoutines: true }
+    ).S
+    expect(S.routines.map(r => r.id)).toEqual(['tpl-day-a', 'mine'])
+    expect(S.week).toEqual({ 3: 'mine' })
   })
 })
