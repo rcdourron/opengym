@@ -5,7 +5,8 @@ import {
   buildPush,
   mergePull,
   sheetDate,
-  routineFromTemplate
+  routineFromTemplate,
+  buildBodyPush
 } from './sheets-sync.js'
 
 const URL0 = 'https://script.google.com/macros/s/AKfycbTEST_abc-123/exec'
@@ -384,5 +385,30 @@ describe('routineFromTemplate', () => {
     ).S
     expect(S.routines.map(r => r.id)).toEqual(['tpl-day-a', 'mine'])
     expect(S.week).toEqual({ 3: 'mine' })
+  })
+})
+
+describe('weigh-ins', () => {
+  it('sends weigh-ins logged or changed in openGym, not ones that came from the sheet', () => {
+    const { S, bodySheet } = mergePull(base(), { body: [{ date: '2026-10-20', lb: 201.3 }] })
+    expect(bodySheet).toEqual({ '2026-10-20': 201.3 })
+    S.bodyweight.push({ d: '2026-10-25', w: 200.4, t: 0 })
+    const b = buildBodyPush(S, { bodySheet })
+    expect(b.upserts).toEqual([{ date: '2026-10-25', lb: 200.4 }])
+    expect(b.deletes).toEqual([])
+    // after sending, nothing is resent
+    expect(buildBodyPush(S, { bodySheet: b.next }).upserts).toEqual([])
+    // editing a sheet weigh-in sends it; removing one deletes it
+    S.bodyweight[0].w = 201.0
+    S.bodyweight = S.bodyweight.filter(x => x.d !== '2026-10-25')
+    const c = buildBodyPush(S, { bodySheet: b.next })
+    expect(c.upserts).toEqual([{ date: '2026-10-20', lb: 201 }])
+    expect(c.deletes).toEqual(['2026-10-25'])
+  })
+  it('converts kg weigh-ins to pounds and never deletes before the first pull', () => {
+    const S = { ...base(), unit: 'kg', bodyweight: [{ d: '2026-10-25', w: 91, t: 0 }] }
+    const b = buildBodyPush(S, {})
+    expect(b.upserts).toEqual([{ date: '2026-10-25', lb: 200.6 }])
+    expect(b.deletes).toEqual([])
   })
 })

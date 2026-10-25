@@ -235,7 +235,32 @@ export function buildPush(S, cfg) {
       if (pushed[u.id] !== h) upserts.push(u)
     })
   const deletes = Object.keys(pushed).filter(id => !(id in seen))
-  return { upserts, deletes, next: seen }
+  return { upserts, deletes, next: seen, body: buildBodyPush(S, cfg) }
+}
+
+/**
+ * Weigh-ins to send: anything logged or changed in openGym since the sheet's Body tab was last
+ * seen (cfg.bodySheet: date → lb), and dates removed in openGym. Weigh-ins that came from the
+ * sheet and weren't touched match bodySheet, so they aren't sent back.
+ */
+export function buildBodyPush(S, cfg) {
+  const unit = S.unit === 'kg' ? 'kg' : 'lb'
+  const last = cfg.bodySheet || {}
+  const next = { ...last }
+  const upserts = []
+  const have = new Set()
+  ;(S.bodyweight || []).forEach(b => {
+    if (!b || !/^\d{4}-\d{2}-\d{2}$/.test(String(b.d)) || !(b.w > 0)) return
+    const lb = toLb(b.w, unit)
+    have.add(b.d)
+    if (last[b.d] !== lb) {
+      upserts.push({ date: b.d, lb })
+      next[b.d] = lb
+    }
+  })
+  const deletes = cfg.bodySheet ? Object.keys(last).filter(d => !have.has(d)) : []
+  deletes.forEach(d => delete next[d])
+  return { upserts, deletes, next }
 }
 
 /* -------------------------------------------------- sheet → openGym state ---- */
@@ -543,9 +568,16 @@ export function mergePull(S0, resp, prevNames = {}, opts = {}) {
   const have = new Set((S.customEx || []).map(c => c.id))
   S.customEx = (S.customEx || []).concat(Object.values(ctx.customs).filter(c => !have.has(c.id)))
 
+  const bodySheet = {}
+  ;(resp.body || []).forEach(b => {
+    if (b && /^\d{4}-\d{2}-\d{2}/.test(String(b.date)) && b.lb > 0)
+      bodySheet[String(b.date).slice(0, 10)] = round1(Number(b.lb))
+  })
+
   return {
     S,
     names: ctx.names,
+    bodySheet: Array.isArray(resp.body) ? bodySheet : null,
     counts: { workouts: imported.length, cardio: cardio.length, weighIns, routines }
   }
 }
@@ -580,13 +612,21 @@ export async function pullFromSheet(getS, cfg, opts = {}) {
 }
 
 export async function pushToSheet(S, cfg) {
-  const { upserts, deletes, next } = buildPush(S, cfg)
-  if (!upserts.length && !deletes.length) return { wrote: 0, next }
+  const { upserts, deletes, next, body } = buildPush(S, cfg)
+  if (!upserts.length && !deletes.length && !body.upserts.length && !body.deletes.length)
+    return { wrote: 0, next, bodyNext: body.next }
   const now = new Date().toISOString()
   upserts.forEach(u => {
     u.wrow[9] = now
   })
   // cardio:false — this push doesn't need Strava fetched or cardio sent back
-  await post(cfg, { op: 'sync', upserts, deletes, cardio: false })
-  return { wrote: upserts.length + deletes.length, next }
+  await post(cfg, {
+    op: 'sync',
+    upserts,
+    deletes,
+    bodyUpserts: body.upserts,
+    bodyDeletes: body.deletes,
+    cardio: false
+  })
+  return { wrote: upserts.length + deletes.length + body.upserts.length, next, bodyNext: body.next }
 }
